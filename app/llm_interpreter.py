@@ -1,0 +1,365 @@
+"""LLM-backed operator-note interpreter.
+
+The language model is the ONLY thing that decides what each operator note
+means. Its raw output is treated as untrusted structured data and is always
+run through guardrails.validate_directive_interpretation before use (Problem
+Statement section 08). If the first attempt fails guardrails, we send the
+model a corrective follow-up naming the exact errors and ask it to resubmit
+once before giving up.
+
+Supports two providers, selected via LLM_PROVIDER env var:
+  - "openai" (default): uses Structured Outputs (response_format
+    json_schema, strict=True) -- OpenAI enforces the schema at generation
+    time, so malformed JSON shape is not even possible.
+  - "anthropic": uses tool-use with a forced tool_choice.
+
+Both providers are forced into a fixed JSON schema at the API level, which is
+the strongest guardrail we can put in front of the guardrail module itself.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from typing import Any
+
+from app.guardrails import REQUIRED_KEYS
+
+SYSTEM_PROMPT = """You are the operator-note interpreter for GridWise, a smart-campus energy \
+scheduling system. You will be given a battery's capacity and a numbered list of 1-3 short \
+operator notes describing temporary conditions for the next 24-hour period. Convert EVERY note \
+into exactly one structured directive from the fixed set below. Never invent a directive type \
+outside this set, and never invent or alter demand, tariff, or battery numbers that were not \
+stated in the note.
+
+SUPPORTED DIRECTIVE TYPES
+1. solar_reduction - {"hours": [int...], "factor": number}
+   factor is the USABLE FRACTION THAT REMAINS, not the reduction amount.
+   Example: "output drops to 20%" -> factor 0.2. "an 80% reduction" -> factor 0.2 (100%-80%=20% remains).
+2. minimum_battery_reserve - {"hours": [int...], "minimum_energy_kwh": number}
+   If the note states a percentage of capacity, convert it to an absolute kWh value using the
+   battery capacity given to you. Example: 50% of a 200 kWh battery -> minimum_energy_kwh 100.
+   Get the hours window right too, independently of the kWh value -- these are two separate
+   sub-tasks worth equal care; do not let solving the numeric conversion distract from correctly
+   counting the hours, or vice versa. A note giving both a reserve amount AND a multi-hour window
+   is common -- always double check the hour count against the (end_hour - start_hour) rule above
+   before finalizing, even when the numeric value was easy.
+3. no_charge_window - {"hours": [int...]}
+4. no_discharge_window - {"hours": [int...]}
+5. max_grid_window - {"hours": [int...], "max_grid_kwh": number}
+6. no_op - structured_adjustment must be null. Use this whenever a note does not affect today's
+   24-hour energy schedule (unrelated announcements, other departments, future dates, non-energy
+   topics, or anything not about today's solar/battery/grid operation).
+
+TIME WINDOW RULE
+Hours are integers 0-23. A stated clock range is start-inclusive and end-exclusive: the end
+number is where the window STOPS, so it is never itself included as an hour. This holds no
+matter which connecting word is used -- "to", "until", "between X and Y", "from X to Y" all mean
+the identical start-inclusive/end-exclusive range. "between 2 and 4 PM" means EXACTLY the same
+thing as "from 2 PM to 4 PM" or "2 PM until 4 PM" -- do not treat "between" as including both
+endpoints.
+"1 PM to 3 PM" -> hours [13, 14] (NOT 15, a 2-hour window).
+"3 PM until 6 PM" -> hours [15, 16, 17] (a 3-hour window).
+"5 PM until 9 PM" -> hours [17, 18, 19, 20] (a 4-hour window -- 9 PM is hour 21, so the
+last INCLUDED hour is 20. A common mistake is stopping one hour early at 19; verify by
+counting: 20 - 17 = 4 entries, [17, 18, 19, 20]).
+"8 PM until 11 PM" -> hours [20, 21, 22] (a 3-hour window, same reasoning: 23 - 20 = 3
+entries, NOT [20, 21]).
+This "count the entries" check matters most for windows ending on a whole multiple of 10 or 11
+o'clock and for windows longer than 2 hours -- those are the cases most often shortened by one
+hour in error.
+"between 2 and 4 PM" -> hours [14, 15] (a 2-hour window, same as "2 PM to 4 PM" -- NOT
+[14, 15, 16]).
+A SINGLE-HOUR window is common and correct: "10 to 11 AM" or "from 10 AM to 11 AM" -> hours
+[10] only (NOT [10, 11] -- 11 is the exclusive end, not an included hour).
+
+CLOCK-TO-HOUR CONVERSION (apply exactly, double-check AM hours especially):
+12 AM=0, 1 AM=1, 2 AM=2, 3 AM=3, 4 AM=4, 5 AM=5, 6 AM=6, 7 AM=7, 8 AM=8, 9 AM=9, 10 AM=10,
+11 AM=11, 12 PM=12, 1 PM=13, 2 PM=14, 3 PM=15, 4 PM=16, 5 PM=17, 6 PM=18, 7 PM=19, 8 PM=20,
+9 PM=21, 10 PM=22, 11 PM=23.
+Example: "1 AM to 3 AM" -> start hour is 1 (NOT 0), end hour is 3 (exclusive) -> hours [1, 2].
+When a range gives one AM/PM marker for both numbers (e.g. "10 to 11 AM"), apply it to both.
+24-hour clock references (e.g. "13:00") map directly to that hour.
+
+"MIDNIGHT" AS AN END BOUNDARY: when a range ends AT "midnight" (not an AM hour past it), that is
+simply the end of the current day -- treat it as hour 24, i.e. the window runs through hour 23
+and stops, with NO wraparound into hour 0. "10 PM and midnight" -> hours [22, 23] (2 hours: 22,
+23 -- the day just ends there). "6 PM until midnight" -> hours [18, 19, 20, 21, 22, 23] (6
+hours). Do NOT apply cross-midnight wraparound logic here; "midnight" ending a same-evening
+window is NOT the same as a range that continues into an AM hour the next day.
+
+CROSS-MIDNIGHT WINDOWS (only when the end is an explicit AM hour, e.g. "11 PM to 1 AM", "10 PM
+to 2 AM" -- genuinely continuing past midnight, NOT ending at "midnight" itself): list the
+resulting hours in ascending NUMERICAL order (0-23), never in chronological/listening order.
+"11 PM to 1 AM" covers the 11 PM hour (23) and the 12 AM hour (0), so the required output is
+hours [0, 23] -- NOT [23, 0], which is descending and will be rejected. Always sort the final
+hours list numerically ascending before returning it, regardless of which hour the window
+started at.
+General rule: the hours list always has exactly (end_hour - start_hour) entries, counting up
+from start_hour and stopping before end_hour. Before finalizing any hours array with more than
+one entry, count its length and verify it equals (end_hour - start_hour) exactly -- this check
+catches the single most common error in this task.
+
+INTERPRETATION RULES
+- Every note produces exactly one entry, using its 0-based position in the note list as note_index.
+- Only mark applies = true for one of the 5 non-no_op directive types; use applies = false only
+  for no_op.
+- Notes may be phrased in many different ways (percentages, fractions, different clock formats,
+  indirect language). Interpret the underlying operational meaning, not literal keywords -- the
+  same rule can be worded very differently across scenarios.
+- Do not modify demand, tariff, or battery configuration values; only produce the directive.
+- hours arrays must contain unique integers 0-23 in strictly ascending order.
+- structured_adjustment always carries all four fields (hours, factor, minimum_energy_kwh,
+  max_grid_kwh). Set the fields that do not apply to the chosen directive_type to null, and for
+  no_op set structured_adjustment itself to null. Example: no_charge_window sets hours to the
+  real list and leaves factor, minimum_energy_kwh, max_grid_kwh as null.
+
+Respond ONLY with the structured directive_interpretation, one entry per note, in note_index order."""
+
+TOOL_SCHEMA = {
+    "name": "submit_interpretation",
+    "description": "Submit the structured directive interpretation for every operator note.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "directive_interpretation": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "note_index": {"type": "integer"},
+                        "applies": {"type": "boolean"},
+                        "directive_type": {
+                            "type": "string",
+                            "enum": [
+                                "solar_reduction",
+                                "minimum_battery_reserve",
+                                "no_charge_window",
+                                "no_discharge_window",
+                                "max_grid_window",
+                                "no_op",
+                            ],
+                        },
+                        "structured_adjustment": {
+                            "type": ["object", "null"],
+                            "properties": {
+                                "hours": {"type": "array", "items": {"type": "integer"}},
+                                "factor": {"type": "number"},
+                                "minimum_energy_kwh": {"type": "number"},
+                                "max_grid_kwh": {"type": "number"},
+                            },
+                        },
+                        "explanation": {"type": "string"},
+                    },
+                    "required": [
+                        "note_index",
+                        "applies",
+                        "directive_type",
+                        "structured_adjustment",
+                        "explanation",
+                    ],
+                },
+            }
+        },
+        "required": ["directive_interpretation"],
+    },
+}
+
+
+# OpenAI Structured Outputs (strict=True) requires every property to be listed
+# in "required" and forbids additionalProperties, so structured_adjustment is
+# expressed as a flat object with every possible field present but nullable.
+# Guardrails only reads the fields relevant to the chosen directive_type, so
+# the irrelevant nulled-out fields are simply ignored downstream.
+OPENAI_JSON_SCHEMA = {
+    "name": "directive_interpretation_response",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "directive_interpretation": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "note_index": {"type": "integer"},
+                        "applies": {"type": "boolean"},
+                        "directive_type": {
+                            "type": "string",
+                            "enum": [
+                                "solar_reduction",
+                                "minimum_battery_reserve",
+                                "no_charge_window",
+                                "no_discharge_window",
+                                "max_grid_window",
+                                "no_op",
+                            ],
+                        },
+                        "structured_adjustment": {
+                            "type": ["object", "null"],
+                            "properties": {
+                                "hours": {"type": ["array", "null"], "items": {"type": "integer"}},
+                                "factor": {"type": ["number", "null"]},
+                                "minimum_energy_kwh": {"type": ["number", "null"]},
+                                "max_grid_kwh": {"type": ["number", "null"]},
+                            },
+                            "required": ["hours", "factor", "minimum_energy_kwh", "max_grid_kwh"],
+                            "additionalProperties": False,
+                        },
+                        "explanation": {"type": "string"},
+                    },
+                    "required": [
+                        "note_index",
+                        "applies",
+                        "directive_type",
+                        "structured_adjustment",
+                        "explanation",
+                    ],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["directive_interpretation"],
+        "additionalProperties": False,
+    },
+}
+
+
+class LLMInterpreterError(Exception):
+    """Raised when the LLM cannot be reached or never produces valid output."""
+
+
+def _build_user_message(operator_notes: list[str], battery_capacity_kwh: float) -> str:
+    notes_block = "\n".join(f"{i}: {note}" for i, note in enumerate(operator_notes))
+    return (
+        f"Battery capacity_kwh: {battery_capacity_kwh}\n\n"
+        f"Operator notes:\n{notes_block}\n\n"
+        "Call submit_interpretation with exactly one entry per note, in note_index order."
+    )
+
+
+# Each LLM call gets this budget. Worst case is 2 calls (1 corrective retry),
+# leaving headroom under the judge harness's 30s per-request timeout for
+# guardrail/optimizer/replay work (all sub-second).
+LLM_CALL_TIMEOUT_SECONDS = 12.0
+
+
+def _call_anthropic(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    import anthropic
+
+    client = anthropic.Anthropic(
+        api_key=os.environ["ANTHROPIC_API_KEY"], timeout=LLM_CALL_TIMEOUT_SECONDS
+    )
+    model = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+
+    response = client.messages.create(
+        model=model,
+        max_tokens=2048,
+        temperature=0,
+        system=SYSTEM_PROMPT,
+        messages=messages,
+        tools=[TOOL_SCHEMA],
+        tool_choice={"type": "tool", "name": "submit_interpretation"},
+    )
+
+    for block in response.content:
+        if block.type == "tool_use" and block.name == "submit_interpretation":
+            return block.input.get("directive_interpretation", [])
+
+    raise LLMInterpreterError("model did not call submit_interpretation")
+
+
+def _call_openai(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    from openai import OpenAI
+
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"], timeout=LLM_CALL_TIMEOUT_SECONDS)
+    model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+
+    openai_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    openai_messages.extend(messages)
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=openai_messages,
+        temperature=0,
+        response_format={"type": "json_schema", "json_schema": OPENAI_JSON_SCHEMA},
+    )
+
+    message = response.choices[0].message
+    if message.refusal:
+        raise LLMInterpreterError(f"model refused: {message.refusal}")
+    if not message.content:
+        raise LLMInterpreterError("model returned empty content")
+
+    args = json.loads(message.content)
+    raw_entries = args.get("directive_interpretation", [])
+
+    # Flatten structured_adjustment (all-fields-present, strict-mode shape)
+    # back down to only the keys relevant to each entry's directive_type.
+    normalized_entries = []
+    for entry in raw_entries:
+        adj = entry.get("structured_adjustment")
+        directive_type = entry.get("directive_type")
+        if directive_type == "no_op" or adj is None:
+            entry["structured_adjustment"] = None
+        else:
+            relevant_keys = {"hours"} | (REQUIRED_KEYS.get(directive_type, set()) - {"hours"})
+            entry["structured_adjustment"] = {
+                k: v for k, v in adj.items() if k in relevant_keys and v is not None
+            }
+        normalized_entries.append(entry)
+
+    return normalized_entries
+
+
+def _call_llm(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    provider = os.environ.get("LLM_PROVIDER", "openai").lower()
+    try:
+        if provider == "openai":
+            return _call_openai(messages)
+        elif provider == "anthropic":
+            return _call_anthropic(messages)
+        else:
+            raise LLMInterpreterError(f"unsupported LLM_PROVIDER '{provider}'")
+    except LLMInterpreterError:
+        raise
+    except Exception as exc:  # network/auth/provider errors
+        raise LLMInterpreterError(f"LLM call failed: {exc}") from exc
+
+
+def interpret_notes(
+    operator_notes: list[str],
+    battery_capacity_kwh: float,
+    guardrail_check,
+) -> list[dict[str, Any]]:
+    """Interpret operator notes via the LLM, validating with `guardrail_check`.
+
+    guardrail_check(directives) -> (is_valid, errors, normalized). On first
+    failure, one corrective retry is attempted with the specific errors fed
+    back to the model. Raises LLMInterpreterError if still invalid.
+    """
+    user_message = _build_user_message(operator_notes, battery_capacity_kwh)
+    messages: list[dict[str, Any]] = [{"role": "user", "content": user_message}]
+
+    raw = _call_llm(messages)
+    is_valid, errors, normalized = guardrail_check(raw)
+    if is_valid:
+        return normalized
+
+    # One corrective retry with the exact guardrail errors.
+    correction = (
+        "Your previous submission failed validation with these errors:\n"
+        + "\n".join(f"- {e}" for e in errors)
+        + "\n\nResubmit a corrected, complete directive_interpretation covering every note."
+    )
+    messages.append({"role": "assistant", "content": json.dumps({"directive_interpretation": raw})})
+    messages.append({"role": "user", "content": correction})
+
+    raw2 = _call_llm(messages)
+    is_valid2, errors2, normalized2 = guardrail_check(raw2)
+    if is_valid2:
+        return normalized2
+
+    raise LLMInterpreterError(
+        "LLM output failed guardrail validation after retry: " + "; ".join(errors2)
+    )
